@@ -11,6 +11,20 @@ Usage:
     ./venv/bin/python test_runner.py --target https://ref.agenthandshake.dev \\
         --nate-target https://nate.agenthandshake.dev --verbose
 
+CHANGELOG (2026-02-22 12:19):
+  - Improved T21 probe query: changed "What is it?" to "Which mode should I
+    use?" (domain-internally ambiguous — all three AHP modes are valid). A
+    well-implemented concierge should be more likely to ask for clarification
+    when the question has no single correct answer within its domain. Added
+    docstring noting T21b mock-parser companion test is planned.
+  - Improved T16 window annotation: now computes expected first-429 offset
+    from X-RateLimit-Remaining probe and annotates the result with whether
+    the actual first-429 matches the expected window-depletion point.
+  - Documented known coverage gaps in T16 and T21 docstrings:
+    § 6.6 content type negotiation (accept_types / response_types) — untested
+    Session time-based expiry (10-min TTL) — untested (T18 covers turn limit only)
+  - Version: v5.2
+
 CHANGELOG (2026-02-22 11:00):
   - Fixed T22 false-negative: test only accepted HTTP 404/410 for invalid
     session_id, but spec §6.2 says any 4xx is acceptable. Server returned
@@ -403,6 +417,11 @@ def run_all_tests(client: AHPClient, target: str, verbose: bool = False,
         "token_comparison": [asdict(c) for c in comparisons],
         "nate_comparison": [asdict(c) for c in nate_comparisons],
         "latency_profile": latency_profile,
+        "known_coverage_gaps": [
+            "spec §6.6: content type negotiation (accept_types/response_types/unsupported_type 400) — no test",
+            "spec §5.4.3: session time-based expiry (10-min TTL) — T18 covers turn limit only",
+            "spec §6.3: clarification_needed FORMAT — T21 advisory only; server never triggered it in test runs",
+        ],
     }
 
 # ── Individual test functions ─────────────────────────────────────────────────
@@ -840,11 +859,19 @@ def test_clarification_needed(client):
     T21: If the server returns clarification_needed (spec §6.3 MAY), the
     response format MUST be correct (status='clarification_needed' +
     clarification_question field).  If the server never returns it, marks advisory.
-    Sends a maximally ambiguous query to trigger clarification if supported.
+
+    Query is domain-internally ambiguous (all three AHP modes are valid answers)
+    to maximise the chance of triggering clarification on a well-behaved concierge.
+    "What is it?" would be answered as "AHP" by any domain-aware server;
+    "Which mode should I use?" has no single correct answer without more context.
+
+    Known limitation: the reference server answers this directly (no clarification).
+    The advisory pass confirms spec compliance per MAY; §6.3 FORMAT is unverified.
+    A T21b mock-response parser test is planned to verify the format in isolation.
     """
     resp = client.converse(AHPRequest(
         capability="content_search",
-        query="What is it?",  # maximally ambiguous — may trigger clarification
+        query="Which mode should I use?",  # domain-internally ambiguous (MAY trigger clarification)
     ))
     if resp.raw.get("status") == "clarification_needed":
         has_q = "clarification_question" in resp.raw
@@ -960,6 +987,11 @@ def test_rate_limiting(client, target):
     T16: Server must enforce rate limits (429) on burst traffic.
     Records window state (X-RateLimit-Remaining) before burst to document
     how many requests were available at test time.
+
+    Note on non-determinism: T16 runs last; earlier tests consume part of the
+    30/min window. The effective window at T16 start varies by run. We probe
+    X-RateLimit-Remaining immediately before the burst and calculate the expected
+    first-429 offset so results are interpretable regardless of window state.
     """
     # Record window state with a single probe request
     probe = requests.post(
@@ -968,21 +1000,44 @@ def test_rate_limiting(client, target):
               "context": {"requesting_agent": "test"}},
         timeout=5,
     )
-    remaining_before = probe.headers.get("X-RateLimit-Remaining", "unknown")
+    remaining_before_str = probe.headers.get("X-RateLimit-Remaining", "unknown")
     limit_header = probe.headers.get("X-RateLimit-Limit", "unknown")
 
-    # Burst
+    # Compute expected 429 trigger point from remaining window
+    try:
+        remaining_before = int(remaining_before_str)
+        # After the probe we've consumed 1 more; expect 429 after (remaining_before - 1) burst reqs
+        expected_429_at = max(1, remaining_before)
+    except (ValueError, TypeError):
+        remaining_before = None
+        expected_429_at = None
+
+    # Burst (35 > any realistic rate limit window)
     statuses = client.burst(count=35)
     hit_429 = 429 in statuses
     first_429 = statuses.index(429) + 1 if hit_429 else None
 
-    return TestResult("T16", "Rate limiting", hit_429,
-        notes=(
-            f"429 after {first_429} burst requests | "
-            f"Window before burst: {remaining_before}/{limit_header} remaining | "
-            f"Note: window was partially consumed by earlier test requests"
-        ) if hit_429 else
-        "No 429 returned — rate limiting may not be active")
+    # Build notes
+    window_note = (
+        f"Window before burst: {remaining_before_str}/{limit_header} remaining"
+        + (f" → expected 429 at burst req ≤{expected_429_at}" if expected_429_at else "")
+    )
+    if hit_429:
+        match_note = ""
+        if expected_429_at is not None:
+            if first_429 <= expected_429_at + 1:
+                match_note = " (matches expected window)"
+            else:
+                match_note = f" (later than expected {expected_429_at} — window may have reset)"
+        notes = (
+            f"429 after {first_429} burst requests{match_note} | "
+            f"{window_note} | "
+            f"Window partially consumed by earlier test requests ({limit_header} total/min)"
+        )
+    else:
+        notes = f"No 429 returned — rate limiting may not be active | {window_note}"
+
+    return TestResult("T16", "Rate limiting", hit_429, notes=notes)
 
 # ── Whitepaper: Multi-run token comparison with cache-busting ─────────────────
 
@@ -1331,7 +1386,7 @@ def print_report(report: dict):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AHP Test Suite v5.1")
+    parser = argparse.ArgumentParser(description="AHP Test Suite v5.2")
     parser.add_argument("--target", default="http://localhost:3000")
     parser.add_argument("--nate-target", default="",
                         help="Override Nate site URL (default: auto-included)")
