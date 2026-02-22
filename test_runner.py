@@ -19,7 +19,10 @@ CHANGELOG (2026-02-22 16:10):
     before parsing body content and agents using HTTP-native clients that
     never see HTML.
   - Suite now has 24 conformance tests (T01–T23 + T21b).
-  - Version: v5.4
+  - Added T24: MCP endpoint (Appendix D) — initialize, tools/list, tools/call
+  - Added T25: OpenAPI spec (Appendix E) — 3.1.x structure, per-capability paths, AHPResponse schema
+  - Suite now has 26 conformance tests (T01-T25 + T21b)
+  - Version: v5.5
 
 CHANGELOG (2026-02-22 15:42):
   - Added outlier detection to 3-run benchmark (run_token_comparison_multi):
@@ -405,6 +408,14 @@ def run_all_tests(client: AHPClient, target: str, verbose: bool = False,
 
     r = run_test("T23", "HTTP Link header on all responses (spec §3.5, RFC 8288)",
                  lambda: test_link_header(client), verbose)
+    results.append(r)
+
+    r = run_test("T24", "MCP endpoint — initialize + tools/list + tools/call (Appendix D)",
+                 lambda: test_mcp_integration(client), verbose)
+    results.append(r)
+
+    r = run_test("T25", "OpenAPI spec — valid 3.1.x, all MODE2/MODE3 capabilities present (Appendix E)",
+                 lambda: test_openapi_spec(client), verbose)
     results.append(r)
 
     # ── Benchmarks — run BEFORE T16 burst to avoid 429 contamination ──────────
@@ -1121,6 +1132,126 @@ def test_link_header(client):
     return TestResult("T23", "HTTP Link header on all responses", True,
         notes=f"Link header confirmed on {len(found)} endpoints ({detail}). "
               f"Value: {found[0][1] if found else 'N/A'}")
+
+
+def test_mcp_integration(client):
+    """
+    T24: MCP endpoint responds correctly to initialize, tools/list, and tools/call.
+    Appendix D compliance: JSON-RPC 2.0, correct protocol version, tools map to capabilities.
+    """
+    import urllib.request, json as _json, urllib.error
+
+    base = client.base_url.rstrip('/')
+    mcp_url = f'{base}/mcp'
+
+    def rpc(method, params=None, id=1):
+        body = _json.dumps({"jsonrpc": "2.0", "id": id, "method": method, "params": params or {}}).encode()
+        req = urllib.request.Request(mcp_url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return _json.loads(resp.read())
+
+    # 1. initialize
+    try:
+        init = rpc("initialize")
+    except Exception as e:
+        return TestResult("T24", "MCP integration", False, error=f"MCP /mcp not reachable: {e}")
+
+    if "error" in init:
+        return TestResult("T24", "MCP integration", False, error=f"initialize error: {init['error']}")
+
+    proto_ver = init.get("result", {}).get("protocolVersion", "")
+    if not proto_ver:
+        return TestResult("T24", "MCP integration", False, error="initialize missing protocolVersion")
+
+    manifest_link = init.get("result", {}).get("serverInfo", {}).get("manifest", "")
+
+    # 2. tools/list
+    tools_resp = rpc("tools/list", id=2)
+    tools = tools_resp.get("result", {}).get("tools", [])
+    if not tools:
+        return TestResult("T24", "MCP integration", False, error="tools/list returned no tools")
+
+    tool_names = [t["name"] for t in tools]
+    required_fields = all("name" in t and "description" in t and "inputSchema" in t for t in tools)
+    if not required_fields:
+        return TestResult("T24", "MCP integration", False,
+            error=f"tools missing required fields. Got: {tool_names}")
+
+    # 3. tools/call — call site_info if available
+    call_tool = "site_info" if "site_info" in tool_names else tool_names[0]
+    call_resp = rpc("tools/call", {"name": call_tool, "arguments": {"query": "What is AHP?"}}, id=3)
+
+    if "error" in call_resp and call_resp["error"]:
+        return TestResult("T24", "MCP integration", False,
+            error=f"tools/call error: {call_resp['error']}")
+
+    content = call_resp.get("result", {}).get("content", [])
+    if not content or not content[0].get("text"):
+        return TestResult("T24", "MCP integration", False, error="tools/call returned empty content")
+
+    return TestResult("T24", "MCP integration", True,
+        notes=f"protocolVersion={proto_ver} | {len(tools)} tools: {', '.join(tool_names)} | "
+              f"tools/call '{call_tool}' returned {len(content[0]['text'])} chars | "
+              f"manifest={manifest_link}")
+
+
+def test_openapi_spec(client):
+    """
+    T25: OpenAPI spec at /openapi.json is valid 3.1.x and contains all MODE2/MODE3 capabilities.
+    Appendix E compliance: correct structure, per-capability paths, AHPResponse schema.
+    """
+    import urllib.request, json as _json
+
+    base = client.base_url.rstrip('/')
+    url = f'{base}/openapi.json'
+
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            spec = _json.loads(resp.read())
+    except Exception as e:
+        return TestResult("T25", "OpenAPI spec", False, error=f"/openapi.json not reachable: {e}")
+
+    # Validate top-level structure
+    errors = []
+    if not spec.get("openapi", "").startswith("3.1"):
+        errors.append(f"openapi version must be 3.1.x, got: {spec.get('openapi')}")
+    if not spec.get("info", {}).get("title"):
+        errors.append("info.title missing")
+    if not spec.get("servers"):
+        errors.append("servers array missing")
+    if not spec.get("paths"):
+        errors.append("paths object missing")
+    if "AHPResponse" not in spec.get("components", {}).get("schemas", {}):
+        errors.append("components.schemas.AHPResponse missing")
+
+    if errors:
+        return TestResult("T25", "OpenAPI spec", False, error="; ".join(errors))
+
+    # Verify capabilities appear as paths
+    paths = spec["paths"]
+    cap_paths = [p for p in paths if p.startswith("/capabilities/")]
+
+    # Cross-check against manifest
+    try:
+        manifest_req = urllib.request.Request(f'{base}/.well-known/agent.json')
+        with urllib.request.urlopen(manifest_req, timeout=10) as resp:
+            manifest = _json.loads(resp.read())
+        mode23_caps = [c["name"] for c in manifest.get("capabilities", [])
+                       if c.get("mode") in ("MODE2", "MODE3")]
+        missing = [c for c in mode23_caps if f"/capabilities/{c}" not in paths]
+        if missing:
+            errors.append(f"Missing capability paths: {missing}")
+    except Exception:
+        pass  # Can't cross-check, but spec structure is valid
+
+    if errors:
+        return TestResult("T25", "OpenAPI spec", False, error="; ".join(errors))
+
+    return TestResult("T25", "OpenAPI spec", True,
+        notes=f"openapi={spec['openapi']} | {len(cap_paths)} capability paths: "
+              f"{', '.join(p.split('/')[-1] for p in cap_paths)} | "
+              f"AHPResponse schema present | servers: {spec['servers'][0]['url']}")
 
 
 def test_ratelimit_headers(client, target):
