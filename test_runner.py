@@ -11,6 +11,33 @@ Usage:
     ./venv/bin/python test_runner.py --target https://ref.agenthandshake.dev \\
         --nate-target https://nate.agenthandshake.dev --verbose
 
+CHANGELOG (2026-02-22 10:00):
+  - Fixed T08 false-negative: 'FIRST QUESTION' in exclusion list matched
+    'In your first question, you requested...' which DEMONSTRATES session memory.
+    Removed 'FIRST QUESTION' (too ambiguous); kept only unambiguous no-memory
+    phrases like 'DON'T HAVE ANY RECORD', 'THIS IS THE FIRST MESSAGE', etc.
+    v4 live run confirmed: server answers 'You asked specifically about MODE1.
+    In your first question, you requested...' → T08 correctly PASSES with fix.
+  - Added T21: clarification_needed response format (spec §6.3) — verifies
+    the response format is correct if server returns clarification; advisory
+    if server never triggers clarification on test queries
+  - Added T22: invalid session_id handling (spec §6.2) — verifies server
+    handles unknown/expired session IDs gracefully (no 5xx)
+  - Noted naive latency as single measurement (not 3-run mean) in output
+
+CHANGELOG (2026-02-22 09:00):
+  - Fixed T08 false-pass: previous version matched 'FIRST' in 'this is your
+    FIRST question to me' — the opposite of session memory. Added explicit
+    context-failure phrase exclusion list; any response containing phrases like
+    'haven't asked', 'first question', 'no previous context', etc. now FAILS.
+  - Redesigned latency profile: 10 cold-cache (unique nonces, forced misses) +
+    10 cache-hit (repeated query). Eliminates 'all 20 samples cached' artifact.
+  - Added T20: rate-limit header conformance (spec §11.1) — verifies
+    X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-RateLimit-Window
+    are present and numeric on every response
+  - Strengthened T17 output: from 'advisory' to 'CRITICAL KNOWN DEFECT'
+    language to match the severity of the spec §5.3 MUST violation
+
 CHANGELOG (2026-02-22 08:00):
   - Fixed T12 false-pass: changed query to use known product IDs (AHP-IMPL-001,
     AHP-SUPPORT-001), added price regex assertion ($\\d), excluded failure phrases
@@ -313,6 +340,18 @@ def run_all_tests(client: AHPClient, target: str, verbose: bool = False,
                  lambda: test_oversized_body(client, target), verbose)
     results.append(r)
 
+    r = run_test("T20", "Rate-limit headers present on all responses (spec §11.1)",
+                 lambda: test_ratelimit_headers(client, target), verbose)
+    results.append(r)
+
+    r = run_test("T21", "Clarification needed — format valid if triggered (spec §6.3)",
+                 lambda: test_clarification_needed(client), verbose)
+    results.append(r)
+
+    r = run_test("T22", "Invalid session_id handled gracefully (spec §6.2)",
+                 lambda: test_invalid_session(client), verbose)
+    results.append(r)
+
     # ── Benchmarks — run BEFORE T16 burst to avoid 429 contamination ──────────
     print("\n[Benchmark] Running token efficiency comparison (3 runs per query, cache-busted)...")
     queries = get_site_queries(target)
@@ -444,11 +483,23 @@ def test_malformed_request(client, target):
 def test_multiturn(client):
     """
     Verifies session memory: Turn 1 asks about MODE1 specifically.
-    Turn 2 asks which mode was just discussed — must reference MODE1.
+    Turn 2 asks which mode was just discussed.
+
+    CRITICAL: a server without session memory will respond to turn 2 with
+    something like "this is your first question" or "I haven't been asked
+    about any mode yet."  Previous versions of this test had a false-positive
+    bug where "FIRST" matched "this is your FIRST question" — the opposite of
+    context awareness.
+
+    The correct logic is:
+      PASS  = answer contains positive context signals (MODE1/MODE 1/STATIC)
+              AND does not contain context-failure phrases
+      FAIL  = answer contains context-failure phrases  (no session memory)
+      FAIL  = answer contains neither (ambiguous / no useful signal)
     """
     r1 = client.converse(AHPRequest(
         capability="content_search",
-        query="Tell me about AHP modes — focus especially on MODE1"
+        query="Tell me about AHP modes — focus especially on MODE1",
     ))
     assert r1.status == "success", f"Turn 1 failed: {r1.status}"
     sid = r1.session_id
@@ -462,17 +513,82 @@ def test_multiturn(client):
     assert r2.http_status == 200, f"Turn 2 HTTP {r2.http_status}"
     assert r2.session_id == sid, "Session ID must persist across turns"
 
-    answer2 = r2.raw.get("response", {}).get("answer", "").upper()
-    references_turn1 = ("MODE1" in answer2 or "MODE 1" in answer2
-                        or "FIRST" in answer2 or "STATIC" in answer2)
-    note = ("Session memory verified — turn 2 references MODE1 from turn 1"
-            if references_turn1
-            else "WARNING: turn 2 answer may not use session context")
+    answer2_raw = r2.raw.get("response", {}).get("answer", "")
+    answer2 = answer2_raw.upper()
 
-    return TestResult("T08", "Multi-turn + memory", references_turn1,
+    # Phrases that indicate the server has NO session memory.
+    # If any of these appear, the test fails regardless of positive keywords.
+    #
+    # IMPORTANT — avoid ambiguous phrases like "FIRST QUESTION":
+    #   "In your FIRST QUESTION, you asked about MODE1"  ← shows memory (PASS)
+    #   "This is your FIRST QUESTION to me"              ← no memory (FAIL)
+    #   "It appears I haven't received a FIRST QUESTION" ← no memory (FAIL)
+    # Only include phrases that are unambiguously no-memory indicators.
+    #
+    # Confirmed from live server responses (2026-02-22):
+    #   "I don't have any record of previous questions you've asked.
+    #    This is the first message in our conversation."  (09:04 UTC run)
+    no_memory_phrases = [
+        "HAVEN'T ASKED",
+        "DON'T HAVE CONTEXT",
+        "DO NOT HAVE CONTEXT",
+        "NEW CONVERSATION",
+        "STARTING FRESH",
+        "HAVEN'T MENTIONED",
+        "THIS IS YOUR FIRST",      # "This is your first question/message"
+        "THAT'S YOUR FIRST",
+        "THAT IS YOUR FIRST",
+        "HAVEN'T DISCUSSED",
+        # Confirmed from live server responses (2026-02-22 09:04):
+        "DON'T HAVE ANY RECORD",
+        "DO NOT HAVE ANY RECORD",
+        "NO RECORD OF PREVIOUS",   # more specific than "NO RECORD OF"
+        "THIS IS THE FIRST MESSAGE",
+        "FIRST MESSAGE IN OUR CONVERSATION",
+        "FIRST INTERACTION",
+        "DON'T HAVE ACCESS TO PREVIOUS",
+        "DO NOT HAVE ACCESS TO PREVIOUS",
+        "WITHOUT PRIOR CONTEXT",
+        "WITHOUT ANY PRIOR",
+        "HAVEN'T SEEN ANY PREVIOUS",
+        "NO PREVIOUS MESSAGES",
+        "NO HISTORY OF",            # more specific than "NO HISTORY"
+        "NO PRIOR CONVERSATION",
+        "NO RECORD OF ANY PREVIOUS",
+    ]
+    context_failure_phrases = [p for p in no_memory_phrases if p in answer2]
+
+    # Positive signals: the answer references what was asked in turn 1
+    positive_signals = ("MODE1" in answer2 or "MODE 1" in answer2
+                        or "STATIC SERVE" in answer2
+                        or ("STATIC" in answer2 and "MODE" in answer2))
+
+    if context_failure_phrases:
+        # Server explicitly says it has no memory — definitive failure
+        return TestResult("T08", "Multi-turn + memory", False,
+            latency_ms=r2.latency_ms,
+            tokens_used=r1.tokens_used + r2.tokens_used,
+            notes=f"Session {sid}. FAIL: server has no session memory. "
+                  f"Context-failure phrases detected: {context_failure_phrases}. "
+                  f"Turn 2 answer: '{answer2_raw[:150]}'",
+            error="Server does not implement session memory (spec §6.2). "
+                  "Turn 2 response indicates no awareness of turn 1.")
+
+    if not positive_signals:
+        return TestResult("T08", "Multi-turn + memory", False,
+            latency_ms=r2.latency_ms,
+            tokens_used=r1.tokens_used + r2.tokens_used,
+            notes=f"Session {sid}. FAIL: turn 2 answer does not reference "
+                  f"MODE1 from turn 1, and no context-failure phrase detected. "
+                  f"Answer: '{answer2_raw[:150]}'",
+            error="Turn 2 answer does not reference turn 1 context (MODE1 not mentioned).")
+
+    return TestResult("T08", "Multi-turn + memory", True,
         latency_ms=r2.latency_ms,
         tokens_used=r1.tokens_used + r2.tokens_used,
-        notes=f"Session {sid}. {note}. Turn 2: '{answer2[:100]}...'")
+        notes=f"Session {sid}. PASS: turn 2 references MODE1 from turn 1 "
+              f"and no context-failure phrases detected. "
+              f"Turn 2: '{answer2_raw[:120]}...'")
 
 def test_response_schema(client):
     resp = client.converse(AHPRequest(capability="site_info",
@@ -638,11 +754,18 @@ def test_mode3_auth_required(client):
         )
     notes = " | ".join(detail)
     if any_allowed:
-        notes += " | Spec §5.3 requires action capabilities to reject unauthenticated requests"
+        notes += (
+            " | CRITICAL KNOWN DEFECT: This server accepts unauthenticated MODE3 "
+            "action requests in violation of spec §5.3 (MUST require authentication). "
+            "Do NOT deploy to production without implementing authentication. "
+            "This is the reference implementation's intentional demo-mode deviation — "
+            "every production deployment must override this default."
+        )
     return TestResult("T17", "MODE3 auth enforcement", not any_allowed,
         notes=notes,
         error="" if not any_allowed else
-              "Mode3 action capabilities accept unauthenticated requests (spec §5.3)")
+              "CRITICAL: MODE3 action capabilities accept unauthenticated requests "
+              "(spec §5.3 MUST violation). Not safe for production deployment.")
 
 def test_session_turn_limit(client):
     """
@@ -706,6 +829,123 @@ def test_oversized_body(client, target):
         error="" if passed else
               f"Expected 413 for >8KB body, got {r.status_code} (spec §6.5)")
 
+def test_clarification_needed(client):
+    """
+    T21: If the server returns clarification_needed (spec §6.3 MAY), the
+    response format MUST be correct (status='clarification_needed' +
+    clarification_question field).  If the server never returns it, marks advisory.
+    Sends a maximally ambiguous query to trigger clarification if supported.
+    """
+    resp = client.converse(AHPRequest(
+        capability="content_search",
+        query="What is it?",  # maximally ambiguous — may trigger clarification
+    ))
+    if resp.raw.get("status") == "clarification_needed":
+        has_q = "clarification_question" in resp.raw
+        assert has_q, "clarification_needed response must include clarification_question field"
+        assert resp.http_status == 200, \
+            f"clarification_needed should return 200, got {resp.http_status}"
+        return TestResult("T21", "Clarification needed — format valid", True,
+            notes=f"Server returned clarification_needed. "
+                  f"Question: {resp.raw.get('clarification_question','')[:100]}")
+    else:
+        # Server answered directly — valid; clarification is optional (MAY)
+        return TestResult("T21", "Clarification needed — format valid", True,
+            notes=f"Server answered without clarification "
+                  f"(status={resp.raw.get('status','?')}, mode={resp.mode}). "
+                  "Advisory: clarification_needed flow (spec §6.3) not triggered by "
+                  "test queries. Server is not REQUIRED to clarify — spec says MAY.")
+
+
+def test_invalid_session(client):
+    """
+    T22: Sending an unknown/expired session_id MUST be handled gracefully.
+    Per spec §6.2, the server MUST either:
+      a) Return a session-not-found / session-expired error (HTTP 4xx)
+      b) OR treat it as a fresh session (start new)
+    The server MUST NOT crash or return 5xx.
+    """
+    fake_sid = str(uuid.uuid4())
+    resp = client.converse(AHPRequest(
+        capability="content_search",
+        query="What is AHP?",
+        session_id=fake_sid,
+    ))
+    # Server must not 5xx
+    assert resp.http_status < 500, \
+        f"Server crashed (5xx) on unknown session_id (HTTP {resp.http_status})"
+
+    code = resp.raw.get("code", "")
+    if resp.http_status in (404, 410) or "session" in code.lower():
+        return TestResult("T22", "Invalid session_id handled gracefully", True,
+            notes=f"Server returned session-error response "
+                  f"(HTTP {resp.http_status}, code={code}). "
+                  "Correct per spec §6.2.")
+    elif resp.http_status == 200 and resp.status == "success":
+        new_sid = resp.session_id or ""
+        treated_as_new = bool(new_sid) and new_sid != fake_sid
+        return TestResult("T22", "Invalid session_id handled gracefully", True,
+            notes=f"Server treated unknown session_id as new session. "
+                  f"Sent: {fake_sid[:8]}... → Got: {new_sid[:8] if new_sid else 'N/A'}... "
+                  f"({'new session created' if treated_as_new else 'same ID echoed back'}). "
+                  "Acceptable per spec §6.2.")
+    else:
+        return TestResult("T22", "Invalid session_id handled gracefully", False,
+            notes=f"Unexpected response to unknown session_id: "
+                  f"HTTP {resp.http_status}, status={resp.raw.get('status')}",
+            error=f"Unexpected response to invalid session_id (spec §6.2)")
+
+
+def test_ratelimit_headers(client, target):
+    """
+    T20: Rate-limit headers must be present on every response (spec §11.1).
+    Required headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset,
+    X-RateLimit-Window.
+    Values must be numeric (integers or floats). A server that rate-limits
+    silently (no headers, just 429) violates the spec but would pass T16.
+    This test is separate from T16 — it verifies the *mechanism*, not just
+    that 429 is eventually returned.
+    """
+    required_headers = [
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+        "X-RateLimit-Window",
+    ]
+    r = requests.post(
+        f"{target}/agent/converse",
+        json={"ahp": "0.1", "capability": "site_info",
+              "query": "rate limit header probe",
+              "context": {"requesting_agent": "test"}},
+        headers={"Content-Type": "application/json"},
+        timeout=10,
+    )
+    missing = []
+    non_numeric = []
+    found = {}
+    for h in required_headers:
+        val = r.headers.get(h)
+        if val is None:
+            missing.append(h)
+        else:
+            found[h] = val
+            try:
+                float(val)
+            except (ValueError, TypeError):
+                non_numeric.append(f"{h}={val!r}")
+
+    passed = not missing and not non_numeric
+    notes = (
+        f"All rate-limit headers present and numeric: {found}"
+        if passed else
+        f"Missing: {missing} | Non-numeric: {non_numeric} | Found: {found}"
+    )
+    return TestResult("T20", "Rate-limit headers present (spec §11.1)", passed,
+        notes=notes,
+        error="" if passed else
+              f"Rate-limit headers missing or non-numeric — "
+              f"visiting agents cannot implement backoff without these (spec §11.1)")
+
 def test_rate_limiting(client, target):
     """
     T16: Server must enforce rate limits (429) on burst traffic.
@@ -766,7 +1006,9 @@ def run_token_comparison_multi(
         naive_base_tokens = count_tokens(full_content)
         naive_note = (
             f"tiktoken cl100k_base estimate of full {len(full_content):,} char document "
-            f"({naive_base_tokens:,} tokens) + per-query overhead. Not API-measured."
+            f"({naive_base_tokens:,} tokens) + per-query overhead. Not API-measured. "
+            f"Fetch latency ({fetch_latency_ms:.0f}ms) is a single measurement, not a "
+            f"3-run mean; it is reused for all queries and all runs in this site's comparison."
         )
         if verbose:
             print(f"  {site_label}: fetched {content_url} — "
@@ -883,46 +1125,99 @@ def run_token_comparison_multi(
 # ── Latency profile ────────────────────────────────────────────────────────────
 
 def run_latency_profile(client: AHPClient, verbose: bool) -> dict:
-    """20-sample profile, separating cached from uncached. p95 is true p95 at n=20."""
-    samples = []
-    query = "What is AHP?"
-    n_samples = 20
+    """
+    Latency profile with explicit cold-cache and cache-hit sampling.
 
-    for i in range(n_samples):
-        resp = client.converse(AHPRequest(
-            capability="content_search", query=query))
+    Uses a split design to ensure both latency classes are measured:
+      - 10 cold-cache samples: unique nonce queries, each a guaranteed cache miss
+      - 10 cache-hit samples: a single repeated query, cached after first call
+
+    This avoids the 'all 20 cached' artifact that occurs when the profile query
+    is already in the cache from earlier tests in the suite.
+
+    p50/p95 are reported separately for cached and uncached cohorts.
+    The overall p95 is computed only when ≥20 mixed samples are available.
+    """
+    samples = []
+
+    # ── 10 cold-cache samples (guaranteed unique, never cached) ──────────────
+    for i in range(10):
+        nonce = uuid.uuid4().hex[:8]
+        query = f"Explain the AHP protocol overview [latency-cold-{nonce}]"
+        resp = client.converse(AHPRequest(capability="content_search", query=query))
         samples.append({
             "run": i + 1,
+            "type": "cold",
             "latency_ms": resp.latency_ms,
             "cached": resp.cached,
             "tokens": resp.tokens_used,
         })
-        if verbose and (i == 0 or i % 5 == 4):
-            print(f"  Run {i+1}: {resp.latency_ms:.0f}ms (cached={resp.cached})")
+        if verbose:
+            print(f"  Cold {i+1}/10: {resp.latency_ms:.0f}ms "
+                  f"(cached={resp.cached}, expected False)")
+
+    # ── 10 cache-hit samples (same query, cached from run 1 onward) ──────────
+    hot_query = "Explain the AHP protocol overview [latency-hot-fixed]"
+    for i in range(10):
+        resp = client.converse(AHPRequest(capability="content_search",
+                                          query=hot_query))
+        samples.append({
+            "run": 10 + i + 1,
+            "type": "hot",
+            "latency_ms": resp.latency_ms,
+            "cached": resp.cached,
+            "tokens": resp.tokens_used,
+        })
+        if verbose and (i == 0 or i == 9):
+            print(f"  Hot  {i+1}/10: {resp.latency_ms:.0f}ms "
+                  f"(cached={resp.cached}, expected True after run 1)")
 
     all_lat   = [s["latency_ms"] for s in samples]
     cached    = [s["latency_ms"] for s in samples if s["cached"]]
     uncached  = [s["latency_ms"] for s in samples if not s["cached"]]
 
-    def p95(lats):
+    # Typed cohorts (by design, not reported flag)
+    cold_lat = [s["latency_ms"] for s in samples if s["type"] == "cold"]
+    hot_lat  = [s["latency_ms"] for s in samples if s["type"] == "hot"]
+
+    def _p95(lats, label=""):
         if len(lats) >= 20:
-            return round(sorted(lats)[int(len(lats) * 0.95)], 1)
-        return round(max(lats), 1) if lats else 0.0
+            v = round(sorted(lats)[int(len(lats) * 0.95)], 1)
+            return v, "true p95"
+        elif lats:
+            return round(max(lats), 1), f"max of {len(lats)} samples (n<20)"
+        return None, "no data"
+
+    all_p95, all_p95_note = _p95(all_lat)
 
     return {
         "samples": samples,
-        "n_samples": n_samples,
+        "n_samples": len(samples),
+        "design": "10 cold-cache (unique nonces) + 10 cache-hit (repeated query)",
+        # All-samples stats
         "p50_ms": round(statistics.median(all_lat), 1),
-        "p95_ms": p95(all_lat),
-        "p95_note": "true p95" if len(all_lat) >= 20 else f"max of {len(all_lat)} samples",
+        "p95_ms": all_p95,
+        "p95_note": all_p95_note,
         "min_ms": round(min(all_lat), 1),
         "max_ms": round(max(all_lat), 1),
-        "cached_p50_ms":  round(statistics.median(cached), 1) if cached else None,
-        "cached_max_ms":  round(max(cached), 1) if cached else None,
-        "cached_n":       len(cached),
-        "uncached_mean_ms": round(statistics.mean(uncached), 1) if uncached else None,
-        "uncached_max_ms":  round(max(uncached), 1) if uncached else None,
-        "uncached_n":       len(uncached),
+        # Cache-hit cohort
+        "cached_p50_ms":   round(statistics.median(cached), 1) if cached else None,
+        "cached_p95_ms":   round(sorted(cached)[int(len(cached)*0.95)], 1)
+                           if len(cached) >= 10 else
+                           (round(max(cached), 1) if cached else None),
+        "cached_max_ms":   round(max(cached), 1) if cached else None,
+        "cached_n":        len(cached),
+        # Cold-cache cohort
+        "uncached_mean_ms":   round(statistics.mean(uncached), 1) if uncached else None,
+        "uncached_median_ms": round(statistics.median(uncached), 1) if uncached else None,
+        "uncached_max_ms":    round(max(uncached), 1) if uncached else None,
+        "uncached_n":         len(uncached),
+        # Design-typed cohort (for cross-checking)
+        "cold_mean_ms":  round(statistics.mean(cold_lat), 1) if cold_lat else None,
+        "cold_p50_ms":   round(statistics.median(cold_lat), 1) if cold_lat else None,
+        "cold_max_ms":   round(max(cold_lat), 1) if cold_lat else None,
+        "hot_p50_ms":    round(statistics.median(hot_lat), 1) if hot_lat else None,
+        "hot_max_ms":    round(max(hot_lat), 1) if hot_lat else None,
     }
 
 # ── Test runner helper ─────────────────────────────────────────────────────────
@@ -1005,22 +1300,29 @@ def print_report(report: dict):
 
     if report.get("latency_profile"):
         lp = report["latency_profile"]
+        design = lp.get("design", "")
         print(f"\n{'='*60}")
-        print(f"LATENCY PROFILE ({lp.get('n_samples', '?')} samples, MODE2 content_search)")
+        print(f"LATENCY PROFILE — MODE2 content_search ({lp.get('n_samples', '?')} samples)")
+        print(f"Design: {design}" if design else "")
         print(f"{'='*60}")
         print(f"All      p50={lp['p50_ms']}ms  p95={lp['p95_ms']}ms "
               f"({lp.get('p95_note','')})  min={lp['min_ms']}ms  max={lp['max_ms']}ms")
-        if lp.get("cached_p50_ms") is not None:
-            print(f"Cached   p50={lp['cached_p50_ms']}ms  max={lp['cached_max_ms']}ms  "
-                  f"(n={lp['cached_n']})")
-        if lp.get("uncached_mean_ms") is not None:
-            print(f"Uncached mean={lp['uncached_mean_ms']}ms  max={lp['uncached_max_ms']}ms  "
-                  f"(n={lp['uncached_n']})")
+        # Cold-cache (unique nonce queries, guaranteed cache misses)
+        if lp.get("cold_mean_ms") is not None:
+            print(f"Cold     mean={lp['cold_mean_ms']}ms  "
+                  f"p50={lp['cold_p50_ms']}ms  "
+                  f"max={lp['cold_max_ms']}ms  "
+                  f"(n=10, forced cold via unique nonces)")
+        # Cache-hit cohort
+        if lp.get("hot_p50_ms") is not None:
+            print(f"Hot/cached p50={lp['hot_p50_ms']}ms  "
+                  f"max={lp['hot_max_ms']}ms  "
+                  f"(n=10, repeated query)")
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AHP Test Suite v2")
+    parser = argparse.ArgumentParser(description="AHP Test Suite v5")
     parser.add_argument("--target", default="http://localhost:3000")
     parser.add_argument("--nate-target", default="",
                         help="Override Nate site URL (default: auto-included)")
