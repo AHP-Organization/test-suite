@@ -8,20 +8,43 @@ Generates a structured JSON report + human-readable summary.
 Usage:
     ./venv/bin/python test_runner.py --target https://ref.agenthandshake.dev
     ./venv/bin/python test_runner.py --target http://localhost:3000 --verbose
+    ./venv/bin/python test_runner.py --target https://ref.agenthandshake.dev \\
+        --nate-target https://nate.agenthandshake.dev --verbose
+
+CHANGELOG (2026-02-22):
+  - Fixed T15/T16 ID swap in function bodies (was cosmetic only, now consistent)
+  - Added RAG-baseline comparison test using Claude Haiku + top-3 chunk retrieval
+  - Added per-site query sets: AHP site gets AHP-specific queries; Nate site gets
+    AI-practitioner queries (RAG, prompt engineering, MCP, etc.)
+  - Added multi-run averaging: each comparison query runs 3 times, reporting mean ± stddev
+  - Fixed markdown latency: actually measures llms.txt fetch time instead of hardcoded 200ms
+  - Fixed p95 calculation: now uses 20-sample latency profile, labels cached/uncached clearly
+  - Fixed naive token count: uses tiktoken (cl100k_base) instead of len//4 approximation
+  - Improved T08: verifies server actually uses session context (memory test), not just ID echo
+  - Added T17: MODE3 action capabilities must reject unauthenticated requests (401)
 """
 
 import argparse
 import json
-import time
-import sys
 import os
+import re
 import statistics
+import sys
+import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 
 import requests
+import tiktoken
 from ahp_client import AHPClient, AHPRequest
+
+# ── Tokenizer (cl100k_base ≈ Claude / GPT-4 encoding) ────────────────────────
+_ENC = tiktoken.get_encoding("cl100k_base")
+
+def count_tokens(text: str) -> int:
+    """Count tokens using cl100k_base encoding (close to Claude's tokenizer)."""
+    return len(_ENC.encode(text))
 
 # ── Result types ──────────────────────────────────────────────────────────────
 
@@ -40,20 +63,158 @@ class TestResult:
     raw_response: dict = field(default_factory=dict)
 
 @dataclass
-class ComparisonResult:
-    query: str
-    markdown_tokens: int
+class ComparisonRunResult:
+    """Single-run token comparison across three approaches."""
+    run: int
     ahp_tokens: int
-    markdown_latency_ms: float
     ahp_latency_ms: float
-    markdown_answer_length: int
-    ahp_answer_length: int
-    token_reduction_pct: float
-    latency_delta_ms: float
+    rag_tokens: int           # RAG-baseline: top-3 chunks + query sent to Haiku
+    rag_latency_ms: float
+    naive_tokens: int         # Naive: full doc + query sent to Haiku (estimated via tiktoken)
+    naive_latency_ms: float   # Measured: actual llms.txt fetch time
+
+@dataclass
+class ComparisonResult:
+    """Multi-run averaged comparison result for a single query."""
+    query: str
+    site: str
+    runs: int
+    # Naive baseline (full-document, no retrieval) — tiktoken estimate, not API-measured
+    naive_tokens_mean: float
+    naive_tokens_note: str    # clarifies estimation methodology
+    naive_latency_mean_ms: float
+    # RAG baseline (client-side top-3 chunk retrieval via Claude Haiku)
+    rag_tokens_mean: float
+    rag_tokens_stddev: float
+    rag_latency_mean_ms: float
+    rag_latency_stddev_ms: float
+    # AHP MODE2
+    ahp_tokens_mean: float
+    ahp_tokens_stddev: float
+    ahp_latency_mean_ms: float
+    ahp_latency_stddev_ms: float
+    # Reductions
+    reduction_vs_naive_pct: float
+    reduction_vs_rag_pct: float
+    raw_runs: list = field(default_factory=list)
+
+# ── Per-site query sets ───────────────────────────────────────────────────────
+
+# AHP site: protocol-specific queries
+AHP_SITE_QUERIES = [
+    ("Explain what MODE1 is in the Agent Handshake Protocol", "content_search"),
+    ("How does AHP discovery work for headless browser agents?", "content_search"),
+    ("What are AHP content signals and what do they declare?", "content_search"),
+    ("How do I build a MODE2 interactive knowledge endpoint?", "content_search"),
+    ("What rate limits should a MODE2 AHP server enforce?", "content_search"),
+]
+
+# Nate site: AI-practitioner queries appropriate to a personal blog/guides site
+NATE_SITE_QUERIES = [
+    ("What is RAG and how does it work?", "content_search"),
+    ("Explain prompt engineering", "content_search"),
+    ("What is MCP and how does it relate to AI agents?", "content_search"),
+    ("What is vibe coding?", "content_search"),
+    ("How do AI agents work in production?", "content_search"),
+]
+
+def get_site_queries(target: str) -> list:
+    """Select comparison queries based on the target URL."""
+    if "nate" in target.lower():
+        return NATE_SITE_QUERIES
+    return AHP_SITE_QUERIES
+
+def get_site_label(target: str) -> str:
+    """Human-readable label for a site target."""
+    if "nate" in target.lower():
+        return "Nate Jones site"
+    return "AHP Specification site"
+
+# ── RAG baseline helpers ──────────────────────────────────────────────────────
+
+def chunk_document(text: str, target_chars: int = 500) -> list[str]:
+    """
+    Split a document into chunks of ~target_chars by paragraph boundary.
+    Filters blank/trivial paragraphs and merges short ones.
+    """
+    paragraphs = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
+    chunks = []
+    current = ""
+    for para in paragraphs:
+        if len(para) < 30:
+            continue  # skip trivial lines (headings with no content)
+        if current and len(current) + len(para) + 1 > target_chars:
+            chunks.append(current)
+            current = para
+        else:
+            current = (current + "\n\n" + para).strip() if current else para
+    if current:
+        chunks.append(current)
+    return chunks
+
+def keyword_score(query: str, chunk: str) -> float:
+    """
+    Compute keyword overlap score between a query and a chunk.
+    Returns proportion of unique query words (≥4 chars) found in the chunk.
+    Simple, fast, no external dependencies.
+    """
+    query_words = set(w.lower() for w in re.findall(r'\b\w{4,}\b', query))
+    chunk_lower = chunk.lower()
+    if not query_words:
+        return 0.0
+    hits = sum(1 for w in query_words if w in chunk_lower)
+    return hits / len(query_words)
+
+def run_rag_query(api_key: str, query: str, chunks: list[str],
+                  model: str = "claude-haiku-4-5", top_k: int = 3) -> tuple[str, int, float]:
+    """
+    RAG-baseline: retrieve top-k chunks by keyword overlap, call Claude Haiku,
+    return (answer, tokens_used, latency_ms).
+    Uses raw HTTP to avoid adding anthropic SDK as a hard dependency for the harness,
+    but the SDK is used if available.
+    """
+    # Score and select top-k chunks
+    scored = sorted(chunks, key=lambda c: keyword_score(query, c), reverse=True)
+    selected = scored[:top_k]
+    context = "\n\n---\n\n".join(selected)
+
+    prompt = (
+        f"Answer the following question using ONLY the provided context. "
+        f"Be concise and accurate.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {query}"
+    )
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    start = time.perf_counter()
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers=headers,
+        json=body,
+        timeout=30,
+    )
+    latency_ms = (time.perf_counter() - start) * 1000
+    r.raise_for_status()
+    data = r.json()
+    answer = data["content"][0]["text"] if data.get("content") else ""
+    usage = data.get("usage", {})
+    tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    return answer, tokens, round(latency_ms, 2)
 
 # ── Test scenarios ─────────────────────────────────────────────────────────────
 
-def run_all_tests(client: AHPClient, target: str, verbose: bool = False) -> dict:
+def run_all_tests(client: AHPClient, target: str, verbose: bool = False,
+                  api_key: str = "") -> dict:
     results = []
     comparisons = []
 
@@ -90,8 +251,8 @@ def run_all_tests(client: AHPClient, target: str, verbose: bool = False) -> dict
     r = run_test("T07", "Error handling — missing required field", lambda: test_malformed_request(client, target), verbose)
     results.append(r)
 
-    # ── Test 8: Session management ─────────────────────────────────────────────
-    r = run_test("T08", "Session — multi-turn exchange", lambda: test_multiturn(client), verbose)
+    # ── Test 8: Session management + memory verification ──────────────────────
+    r = run_test("T08", "Session — multi-turn with memory verification", lambda: test_multiturn(client), verbose)
     results.append(r)
 
     # ── Test 9: Response schema validation ────────────────────────────────────
@@ -122,15 +283,27 @@ def run_all_tests(client: AHPClient, target: str, verbose: bool = False) -> dict
     r = run_test("T15", "Caching — repeated query returns cached response", lambda: test_caching(client), verbose)
     results.append(r)
 
+    # ── Test 17: MODE3 action auth enforcement ────────────────────────────────
+    r = run_test("T17", "MODE3 — action capabilities reject unauthenticated requests",
+                 lambda: test_mode3_auth_required(client), verbose)
+    results.append(r)
+
     # ── Whitepaper: Token efficiency comparison ────────────────────────────────
-    print("\n[Whitepaper] Running Agent vs. Markdown token efficiency comparison...")
-    comparisons = run_token_comparison(client, target, verbose)
+    # Run benchmarks BEFORE T16 (rate limiting burst) to avoid 429s polluting results
+    print("\n[Benchmark] Running token efficiency comparison (3 runs per query)...")
+    queries = get_site_queries(target)
+    site_label = get_site_label(target)
+    comparisons = run_token_comparison_multi(client, target, queries, site_label,
+                                             verbose, n_runs=3, api_key=api_key)
 
     # ── Latency profile ────────────────────────────────────────────────────────
-    print("[Whitepaper] Running latency profile...")
+    print("[Benchmark] Running latency profile (20 runs)...")
     latency_profile = run_latency_profile(client, verbose)
 
-    # ── Test 16: Rate limiting — run LAST to avoid polluting other tests ───────
+    # ── Test 16: Rate limiting ─────────────────────────────────────────────────
+    # MUST run LAST — fires 35 burst requests which pollutes rate limits for all
+    # subsequent tests. Always keep this as the final step.
+    print("\n[T16] Rate limiting test (runs last to avoid polluting other tests)...")
     r = run_test("T16", "Rate limiting — 429 on burst", lambda: test_rate_limiting(client), verbose)
     results.append(r)
 
@@ -166,7 +339,7 @@ def test_accept_header(client):
         return TestResult("T02", "Accept header", True, notes="Accept header discovery succeeded")
     except Exception as e:
         return TestResult("T02", "Accept header", False, error=str(e),
-            notes="Site may not implement Accept header redirect (optional)")
+            notes="Site may not implement Accept header redirect (SHOULD per spec)")
 
 def test_agent_notice(client):
     # In-page notice applies to HTML sites. Pure API servers may not serve HTML.
@@ -228,22 +401,38 @@ def test_malformed_request(client, target):
     return TestResult("T07", "Missing field", True, notes="Missing 'query' correctly returns 400")
 
 def test_multiturn(client):
-    # Turn 1
-    r1 = client.converse(AHPRequest(capability="content_search", query="Tell me about AHP modes"))
-    assert r1.status == "success"
+    """
+    Verifies session memory: Turn 1 asks about AHP modes, Turn 2 asks a follow-up
+    that can only be answered correctly if the server actually used session context.
+    """
+    # Turn 1 — establish context
+    r1 = client.converse(AHPRequest(
+        capability="content_search",
+        query="Tell me about AHP modes — focus especially on MODE1"
+    ))
+    assert r1.status == "success", f"Turn 1 failed: {r1.status}"
     sid = r1.session_id
+    assert sid, "Turn 1 must return a session_id"
 
-    # Turn 2 — follow-up in same session
+    # Turn 2 — follow-up requiring turn 1 context
     r2 = client.converse(AHPRequest(
         capability="content_search",
-        query="Which mode should I start with?",
+        query="Which mode did I just ask about specifically?",
         session_id=sid,
     ))
-    assert r2.http_status == 200
-    assert r2.session_id == sid, "Session ID should persist"
-    return TestResult("T08", "Multi-turn", True,
+    assert r2.http_status == 200, f"Turn 2 HTTP {r2.http_status}"
+    assert r2.session_id == sid, "Session ID must persist across turns"
+
+    # The answer should reference MODE1 (from turn 1 context)
+    answer2 = r2.raw.get("response", {}).get("answer", "").upper()
+    references_turn1 = "MODE1" in answer2 or "MODE 1" in answer2 or "FIRST" in answer2
+    memory_note = "Session memory verified (answer references MODE1 from turn 1)" \
+        if references_turn1 else \
+        "WARNING: Answer may not reflect session context — server may not use session history"
+
+    return TestResult("T08", "Multi-turn + memory", references_turn1,
         latency_ms=r2.latency_ms, tokens_used=r1.tokens_used + r2.tokens_used,
-        notes=f"2-turn exchange on session {sid}")
+        notes=f"Session {sid}. Turn 2 answer: '{answer2[:120]}...'. {memory_note}")
 
 def test_response_schema(client):
     resp = client.converse(AHPRequest(capability="site_info", query="What is this site?"))
@@ -284,12 +473,11 @@ def test_get_quote(client):
         capability="get_quote",
         query="Give me a quote for 3 Single Site licenses and 1 Support package as a business customer",
     ))
-    assert resp.http_status == 200
-    assert resp.status == "success"
-    assert resp.mode == "MODE3"
-    assert len(resp.tools_used) > 0
+    assert resp.http_status == 200, f"Expected 200, got {resp.http_status}"
+    assert resp.status == "success", f"Expected success, got {resp.status}"
+    assert resp.mode == "MODE3", f"Expected MODE3, got {resp.mode}"
+    assert len(resp.tools_used) > 0, f"No tools were called (mode={resp.mode})"
     answer = resp.raw.get("response", {}).get("answer", "")
-    # Accept any response that references quantity, cost, or a product name
     price_mentioned = any(term in answer.lower() for term in [
         "$", "usd", "price", "cost", "quote", "total", "license", "support", "discount"
     ])
@@ -315,7 +503,6 @@ def test_order_lookup(client):
         notes=f"Answer: {answer[:100]}...")
 
 def test_human_escalation(client):
-    # Submit async request
     resp = client.converse(AHPRequest(
         capability="human_escalation",
         query="I need a custom enterprise agreement for 500 sites. This requires human review.",
@@ -329,7 +516,6 @@ def test_human_escalation(client):
 
     sid = data["session_id"]
 
-    # Poll for resolution
     poll_start = time.time()
     final = client.poll_status(sid, max_wait_s=60, interval_s=1.0)
     poll_time_ms = (time.time() - poll_start) * 1000
@@ -340,95 +526,230 @@ def test_human_escalation(client):
 
     return TestResult("T14", "MODE3 async escalation", True,
         latency_ms=poll_time_ms,
-        notes=f"Accepted → resolved via polling in {poll_time_ms:.0f}ms. Answer: {answer[:100]}...")
-
-def test_rate_limiting(client):
-    statuses = client.burst(count=35)
-    hit_429 = 429 in statuses
-    first_429 = statuses.index(429) + 1 if hit_429 else None
-    return TestResult("T15", "Rate limiting", hit_429,
-        notes=f"429 hit after {first_429} requests" if hit_429 else "No 429 returned — rate limiting may not be active")
+        notes=f"Accepted → resolved via polling in {poll_time_ms:.0f}ms [SIMULATED human delay]. "
+              f"Note: production human response times are hours to days. "
+              f"Answer: {answer[:100]}...")
 
 def test_caching(client):
+    """T15: Cache hit on repeated identical query."""
     q = "What is MODE2 in the Agent Handshake Protocol?"
-    # First request (cold)
     r1 = client.converse(AHPRequest(capability="content_search", query=q))
-    # Second request (should be cached)
     r2 = client.converse(AHPRequest(capability="content_search", query=q))
     cache_hit = r2.cached
     speedup = r1.latency_ms / r2.latency_ms if r2.latency_ms > 0 else 0
-    return TestResult("T16", "Caching", True,
+    return TestResult("T15", "Caching", True,
         latency_ms=r2.latency_ms,
         notes=f"Cold: {r1.latency_ms:.0f}ms | Cached: {r2.latency_ms:.0f}ms | "
               f"Speedup: {speedup:.1f}x | Cache hit flag: {cache_hit}")
 
-# ── Whitepaper: Token comparison ──────────────────────────────────────────────
+def test_rate_limiting(client):
+    """T16: Server enforces rate limits (429) on burst traffic."""
+    statuses = client.burst(count=35)
+    hit_429 = 429 in statuses
+    first_429 = statuses.index(429) + 1 if hit_429 else None
+    return TestResult("T16", "Rate limiting", hit_429,
+        notes=f"429 hit after {first_429} requests" if hit_429 else
+              "No 429 returned — rate limiting may not be active")
 
-COMPARISON_QUERIES = [
-    ("Explain what MODE1 is in the Agent Handshake Protocol", "content_search"),
-    ("How does AHP discovery work for headless browser agents?", "content_search"),
-    ("What are AHP content signals and what do they declare?", "content_search"),
-    ("How do I build a MODE2 interactive knowledge endpoint?", "content_search"),
-    ("What rate limits should a MODE2 AHP server enforce?", "content_search"),
-]
+def test_mode3_auth_required(client):
+    """
+    T17: MODE3 action capabilities MUST reject unauthenticated requests.
+    Per AHP spec §5.3: capabilities of type 'action' or 'async' MUST require
+    authentication (authentication MUST NOT be 'none').
+    Tests inventory_check, get_quote, and order_lookup without any auth token.
+    """
+    # The base client sends no Authorization header by default.
+    # We call a known action capability and expect 401 Unauthorized.
+    # If the server returns 200, it is violating the spec's security requirement.
+    action_capabilities = [
+        ("inventory_check", "Is the AHP Server License in stock?"),
+        ("get_quote", "Quote for 1 license"),
+        ("order_lookup", "Look up order ORD-2026-001"),
+    ]
 
-def run_token_comparison(client: AHPClient, target: str, verbose: bool) -> list:
+    results_detail = []
+    any_rejected = False
+    any_allowed = False
+
+    for cap, query in action_capabilities:
+        resp = client.converse(AHPRequest(capability=cap, query=query))
+        rejected = resp.http_status == 401
+        if rejected:
+            any_rejected = True
+        else:
+            any_allowed = True
+        results_detail.append(f"{cap}: HTTP {resp.http_status} ({'rejected ✓' if rejected else 'ALLOWED — spec violation'})")
+
+    # Pass if ALL action capabilities require auth, or if at minimum the test
+    # demonstrates server awareness of auth. Fail (note only) if any allow unauthenticated.
+    # Since the reference implementation may intentionally allow demo access,
+    # we report findings without hard failing — this is an advisory test.
+    notes = " | ".join(results_detail)
+    if any_allowed:
+        notes += " | NOTE: Spec §5.3 requires action capabilities to reject unauthenticated requests"
+
+    # Report as pass if any were rejected (showing the server knows about auth),
+    # or as advisory failure if all allowed (spec violation, but may be intentional in demo).
+    passed = not any_allowed  # strict: all must reject
+    return TestResult("T17", "MODE3 auth enforcement", passed,
+        notes=notes,
+        error="" if passed else "One or more MODE3 action capabilities accepted unauthenticated requests (spec §5.3)")
+
+# ── Whitepaper: Multi-run token comparison with RAG baseline ──────────────────
+
+def run_token_comparison_multi(
+    client: AHPClient,
+    target: str,
+    queries: list,
+    site_label: str,
+    verbose: bool,
+    n_runs: int = 3,
+    api_key: str = "",
+) -> list[ComparisonResult]:
+    """
+    Run each comparison query n_runs times across three approaches:
+      1. Naive visiting agent (full llms.txt, no retrieval) — tiktoken estimate
+      2. RAG-baseline visiting agent (top-3 chunks, keyword overlap, Claude Haiku)
+      3. AHP MODE2
+
+    Reports mean ± stddev for each approach.
+    """
     results = []
 
-    # Simulate "markdown agent": fetch the full content doc and count its tokens
+    # Fetch and chunk the document once
     try:
         manifest = client.discover()
-        content_url = manifest.get("endpoints", {}).get("content", "/content/spec.md")
+        content_url = manifest.get("endpoints", {}).get("content", "/llms.txt")
+        fetch_start = time.perf_counter()
         r = requests.get(f"{target}{content_url}", timeout=15)
+        fetch_latency_ms = (time.perf_counter() - fetch_start) * 1000
         full_content = r.text
-        # Rough token estimate: 1 token ≈ 4 chars
-        markdown_base_tokens = len(full_content) // 4
+        chunks = chunk_document(full_content, target_chars=500)
+        # Naive baseline: tiktoken count of full doc + query overhead
+        # This is an estimate (cl100k_base, not the exact Claude tokenizer)
+        naive_base_tokens = count_tokens(full_content)
+        naive_note = (
+            f"tiktoken cl100k_base estimate of full {len(full_content)} char document "
+            f"({naive_base_tokens} tokens) + query. Not API-measured."
+        )
+        if verbose:
+            print(f"  Fetched {content_url}: {len(full_content)} chars, "
+                  f"{len(chunks)} chunks, {naive_base_tokens} tokens (tiktoken), "
+                  f"fetch={fetch_latency_ms:.0f}ms")
     except Exception as e:
         print(f"  [warn] Could not fetch content doc: {e}")
-        markdown_base_tokens = 10000  # fallback estimate
+        full_content = ""
+        chunks = []
+        naive_base_tokens = 10000
+        naive_note = "Could not fetch content doc; using fallback estimate"
+        fetch_latency_ms = 0.0
 
-    for query, capability in COMPARISON_QUERIES:
-        # AHP MODE2
-        resp = client.converse(AHPRequest(capability=capability, query=query))
-        if resp.http_status == 429:
-            print(f"  [warn] Rate limited during comparison — results may be incomplete")
-            time.sleep(5)
-            resp = client.converse(AHPRequest(capability=capability, query=query))
-        ahp_tokens = resp.tokens_used
-        ahp_latency = resp.latency_ms
-        ahp_answer_len = len(resp.raw.get("response", {}).get("answer", ""))
+    for query, capability in queries:
+        run_data: list[ComparisonRunResult] = []
 
-        # "Markdown agent": full doc + query overhead (estimated)
-        md_tokens = markdown_base_tokens + len(query) // 4 + 50  # rough query overhead
-        md_latency = 200.0  # flat estimate for fetching a static doc
-        md_answer_len = ahp_answer_len  # assume same quality answer
+        for run_idx in range(n_runs):
+            # Sleep briefly to avoid rate-limit interference between runs
+            if run_idx > 0:
+                time.sleep(2)
 
-        reduction = (1 - ahp_tokens / md_tokens) * 100 if md_tokens > 0 else 0
+            # ── AHP MODE2 ──
+            ahp_resp = client.converse(AHPRequest(capability=capability, query=query))
+            if ahp_resp.http_status == 429:
+                print(f"  [warn] Rate limited on AHP run {run_idx+1} — waiting 10s")
+                time.sleep(10)
+                ahp_resp = client.converse(AHPRequest(capability=capability, query=query))
+            ahp_tokens = ahp_resp.tokens_used
+            ahp_latency = ahp_resp.latency_ms
 
-        c = ComparisonResult(
+            # ── RAG baseline ──
+            rag_tokens = 0
+            rag_latency = 0.0
+            if chunks and api_key:
+                try:
+                    _, rag_tokens, rag_latency = run_rag_query(api_key, query, chunks)
+                except Exception as e:
+                    print(f"  [warn] RAG query failed on run {run_idx+1}: {e}")
+                    rag_tokens = 0
+                    rag_latency = 0.0
+            elif not api_key:
+                print("  [warn] No ANTHROPIC_API_KEY — RAG baseline skipped")
+
+            # ── Naive: tiktoken estimate of full doc + query overhead ──
+            naive_tokens = naive_base_tokens + count_tokens(query) + 50  # +50 system overhead
+            naive_latency = fetch_latency_ms  # measured fetch time (not a hardcoded constant)
+
+            run_data.append(ComparisonRunResult(
+                run=run_idx + 1,
+                ahp_tokens=ahp_tokens,
+                ahp_latency_ms=ahp_latency,
+                rag_tokens=rag_tokens,
+                rag_latency_ms=rag_latency,
+                naive_tokens=naive_tokens,
+                naive_latency_ms=naive_latency,
+            ))
+
+            if verbose:
+                print(f"  [{run_idx+1}/{n_runs}] {query[:45]:<45} "
+                      f"AHP: {ahp_tokens:>5} | RAG: {rag_tokens:>5} | naive: {naive_tokens:>6}")
+
+        # ── Aggregate across runs ──
+        ahp_tokens_list = [r.ahp_tokens for r in run_data]
+        rag_tokens_list = [r.rag_tokens for r in run_data if r.rag_tokens > 0]
+        naive_tokens_list = [r.naive_tokens for r in run_data]
+        ahp_lat_list = [r.ahp_latency_ms for r in run_data]
+        rag_lat_list = [r.rag_latency_ms for r in run_data if r.rag_latency_ms > 0]
+        naive_lat_list = [r.naive_latency_ms for r in run_data]
+
+        ahp_mean = statistics.mean(ahp_tokens_list)
+        ahp_std = statistics.stdev(ahp_tokens_list) if len(ahp_tokens_list) > 1 else 0.0
+        rag_mean = statistics.mean(rag_tokens_list) if rag_tokens_list else 0.0
+        rag_std = statistics.stdev(rag_tokens_list) if len(rag_tokens_list) > 1 else 0.0
+        naive_mean = statistics.mean(naive_tokens_list)
+        naive_lat_mean = statistics.mean(naive_lat_list)
+        ahp_lat_mean = statistics.mean(ahp_lat_list)
+        ahp_lat_std = statistics.stdev(ahp_lat_list) if len(ahp_lat_list) > 1 else 0.0
+        rag_lat_mean = statistics.mean(rag_lat_list) if rag_lat_list else 0.0
+        rag_lat_std = statistics.stdev(rag_lat_list) if len(rag_lat_list) > 1 else 0.0
+
+        reduction_vs_naive = (1 - ahp_mean / naive_mean) * 100 if naive_mean > 0 else 0
+        reduction_vs_rag = (1 - ahp_mean / rag_mean) * 100 if rag_mean > 0 else 0
+
+        results.append(ComparisonResult(
             query=query,
-            markdown_tokens=md_tokens,
-            ahp_tokens=ahp_tokens,
-            markdown_latency_ms=md_latency,
-            ahp_latency_ms=ahp_latency,
-            markdown_answer_length=md_answer_len,
-            ahp_answer_length=ahp_answer_len,
-            token_reduction_pct=round(reduction, 1),
-            latency_delta_ms=round(ahp_latency - md_latency, 1),
-        )
-        results.append(c)
-        if verbose:
-            print(f"  {query[:50]:<50} AHP: {ahp_tokens:>5} tok | MD: {md_tokens:>6} tok | -{reduction:.0f}%")
+            site=site_label,
+            runs=n_runs,
+            naive_tokens_mean=round(naive_mean, 1),
+            naive_tokens_note=naive_note,
+            naive_latency_mean_ms=round(naive_lat_mean, 1),
+            rag_tokens_mean=round(rag_mean, 1),
+            rag_tokens_stddev=round(rag_std, 1),
+            rag_latency_mean_ms=round(rag_lat_mean, 1),
+            rag_latency_stddev_ms=round(rag_lat_std, 1),
+            ahp_tokens_mean=round(ahp_mean, 1),
+            ahp_tokens_stddev=round(ahp_std, 1),
+            ahp_latency_mean_ms=round(ahp_lat_mean, 1),
+            ahp_latency_stddev_ms=round(ahp_lat_std, 1),
+            reduction_vs_naive_pct=round(reduction_vs_naive, 1),
+            reduction_vs_rag_pct=round(reduction_vs_rag, 1),
+            raw_runs=[asdict(rd) for rd in run_data],
+        ))
 
     return results
 
 # ── Latency profile ────────────────────────────────────────────────────────────
 
 def run_latency_profile(client: AHPClient, verbose: bool) -> dict:
+    """
+    Run 20 latency samples. First run warms the cache; subsequent runs are cached.
+    Reports stats separately for uncached vs cached runs.
+    p95 requires ≥20 samples to be statistically meaningful — with fewer samples
+    the reported value is labeled as 'max of N samples'.
+    """
     samples = []
     query = "What is AHP?"
+    n_samples = 20
 
-    for i in range(5):
+    for i in range(n_samples):
         resp = client.converse(AHPRequest(capability="content_search", query=query))
         samples.append({
             "run": i + 1,
@@ -436,16 +757,35 @@ def run_latency_profile(client: AHPClient, verbose: bool) -> dict:
             "cached": resp.cached,
             "tokens": resp.tokens_used,
         })
-        if verbose:
+        if verbose and (i == 0 or i % 5 == 4):
             print(f"  Run {i+1}: {resp.latency_ms:.0f}ms (cached={resp.cached})")
 
-    latencies = [s["latency_ms"] for s in samples]
+    all_latencies = [s["latency_ms"] for s in samples]
+    uncached = [s["latency_ms"] for s in samples if not s["cached"]]
+    cached = [s["latency_ms"] for s in samples if s["cached"]]
+
+    def p95(latencies):
+        if len(latencies) >= 20:
+            return round(sorted(latencies)[int(len(latencies) * 0.95)], 1)
+        return round(max(latencies), 1)  # labeled as max if insufficient samples
+
     return {
         "samples": samples,
-        "p50_ms": round(statistics.median(latencies), 1),
-        "p95_ms": round(sorted(latencies)[int(len(latencies) * 0.95)], 1) if len(latencies) >= 2 else latencies[-1],
-        "min_ms": round(min(latencies), 1),
-        "max_ms": round(max(latencies), 1),
+        "n_samples": n_samples,
+        # All samples
+        "p50_ms": round(statistics.median(all_latencies), 1),
+        "p95_ms": p95(all_latencies),
+        "p95_note": "true p95" if len(all_latencies) >= 20 else f"max of {len(all_latencies)} samples",
+        "min_ms": round(min(all_latencies), 1),
+        "max_ms": round(max(all_latencies), 1),
+        # Cached-only stats
+        "cached_p50_ms": round(statistics.median(cached), 1) if cached else None,
+        "cached_max_ms": round(max(cached), 1) if cached else None,
+        "cached_n": len(cached),
+        # Uncached-only stats
+        "uncached_mean_ms": round(statistics.mean(uncached), 1) if uncached else None,
+        "uncached_max_ms": round(max(uncached), 1) if uncached else None,
+        "uncached_n": len(uncached),
     }
 
 # ── Test runner helper ─────────────────────────────────────────────────────────
@@ -494,43 +834,68 @@ def print_report(report: dict):
 
     if report.get("token_comparison"):
         print(f"\n{'='*60}")
-        print("TOKEN EFFICIENCY (Agent vs. Markdown)")
+        print("TOKEN EFFICIENCY (3-run averages: AHP vs. RAG-baseline vs. Naive)")
         print(f"{'='*60}")
         rows = []
         for c in report["token_comparison"]:
+            rag_str = f"{c['rag_tokens_mean']:.0f} ±{c['rag_tokens_stddev']:.0f}" \
+                if c['rag_tokens_mean'] > 0 else "N/A"
+            ahp_str = f"{c['ahp_tokens_mean']:.0f} ±{c['ahp_tokens_stddev']:.0f}"
             rows.append([
-                c["query"][:40],
-                c["markdown_tokens"],
-                c["ahp_tokens"],
-                f"{c['token_reduction_pct']}%",
+                c["query"][:38],
+                f"{c['naive_tokens_mean']:.0f}*",
+                rag_str,
+                ahp_str,
+                f"{c['reduction_vs_naive_pct']}%",
+                f"{c['reduction_vs_rag_pct']}%" if c['rag_tokens_mean'] > 0 else "—",
             ])
         print(tabulate(rows,
-            headers=["Query", "Markdown tokens", "AHP tokens", "Reduction"],
+            headers=["Query", "Naive*", "RAG-baseline", "AHP MODE2", "vs. Naive", "vs. RAG"],
             tablefmt="simple"))
-        reductions = [c["token_reduction_pct"] for c in report["token_comparison"]]
-        print(f"\nAverage token reduction: {sum(reductions)/len(reductions):.1f}%")
+        print("* Naive = tiktoken estimate of full document (no retrieval). Not API-measured.")
+
+        ahp_means = [c["ahp_tokens_mean"] for c in report["token_comparison"]]
+        naive_means = [c["naive_tokens_mean"] for c in report["token_comparison"]]
+        avg_red_naive = (1 - sum(ahp_means) / sum(naive_means)) * 100
+        print(f"\nAvg token reduction vs. naive full-doc baseline: {avg_red_naive:.1f}%")
+
+        rag_comps = [c for c in report["token_comparison"] if c['rag_tokens_mean'] > 0]
+        if rag_comps:
+            ahp_rag = [c["ahp_tokens_mean"] for c in rag_comps]
+            rag_rag = [c["rag_tokens_mean"] for c in rag_comps]
+            avg_red_rag = (1 - sum(ahp_rag) / sum(rag_rag)) * 100
+            print(f"Avg token reduction vs. RAG-baseline (client-side retrieval): {avg_red_rag:.1f}%")
 
     if report.get("latency_profile"):
         lp = report["latency_profile"]
         print(f"\n{'='*60}")
-        print("LATENCY PROFILE (MODE2 content_search, 5 runs)")
+        print(f"LATENCY PROFILE (MODE2 content_search, {lp.get('n_samples', 5)} runs)")
         print(f"{'='*60}")
-        print(f"p50: {lp['p50_ms']}ms  |  p95: {lp['p95_ms']}ms  |  "
-              f"min: {lp['min_ms']}ms  |  max: {lp['max_ms']}ms")
+        print(f"All samples  — p50: {lp['p50_ms']}ms  p95: {lp['p95_ms']}ms ({lp.get('p95_note', '')})  "
+              f"min: {lp['min_ms']}ms  max: {lp['max_ms']}ms")
+        if lp.get("cached_p50_ms") is not None:
+            print(f"Cached only  — p50: {lp['cached_p50_ms']}ms  max: {lp['cached_max_ms']}ms  "
+                  f"(n={lp['cached_n']})")
+        if lp.get("uncached_mean_ms") is not None:
+            print(f"Uncached only — mean: {lp['uncached_mean_ms']}ms  max: {lp['uncached_max_ms']}ms  "
+                  f"(n={lp['uncached_n']})")
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AHP Test Suite")
     parser.add_argument("--target", default="http://localhost:3000", help="AHP server base URL")
+    parser.add_argument("--nate-target", default="", help="Nate Jones site URL (for dual-site comparison)")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--output", "-o", help="Write JSON report to file")
+    parser.add_argument("--api-key", default=os.environ.get("ANTHROPIC_API_KEY", ""),
+                        help="Anthropic API key for RAG-baseline comparison")
     args = parser.parse_args()
 
     client = AHPClient(args.target)
 
     try:
-        report = run_all_tests(client, args.target, args.verbose)
+        report = run_all_tests(client, args.target, args.verbose, api_key=args.api_key)
     except KeyboardInterrupt:
         print("\n\nInterrupted.")
         sys.exit(1)
@@ -541,3 +906,25 @@ if __name__ == "__main__":
     with open(output_path, "w") as f:
         json.dump(report, f, indent=2)
     print(f"\nFull report: {output_path}")
+
+    # ── Optional: run Nate site comparison if --nate-target provided ──────────
+    if args.nate_target:
+        print(f"\n{'='*60}")
+        print(f"Running Nate site comparison: {args.nate_target}")
+        print(f"{'='*60}")
+        nate_client = AHPClient(args.nate_target)
+        nate_queries = get_site_queries(args.nate_target)
+        nate_comps = run_token_comparison_multi(
+            nate_client, args.nate_target, nate_queries,
+            get_site_label(args.nate_target),
+            args.verbose, n_runs=3, api_key=args.api_key
+        )
+        nate_report = {
+            "target": args.nate_target,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "token_comparison": [asdict(c) for c in nate_comps],
+        }
+        nate_path = (args.output or "report").replace(".json", "") + "-nate.json"
+        with open(nate_path, "w") as f:
+            json.dump(nate_report, f, indent=2)
+        print(f"\nNate site comparison saved: {nate_path}")
