@@ -319,7 +319,7 @@ def run_all_tests(client: AHPClient, target: str, verbose: bool = False,
                  lambda: test_discovery(client), verbose)
     results.append(r)
 
-    r = run_test("T02", "Discovery — Accept: application/agent+json",
+    r = run_test("T02", "Capability negotiation — Accept: application/agent+json (spec §3.4)",
                  lambda: test_accept_header(client), verbose)
     results.append(r)
 
