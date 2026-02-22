@@ -11,6 +11,12 @@ Usage:
     ./venv/bin/python test_runner.py --target https://ref.agenthandshake.dev \\
         --nate-target https://nate.agenthandshake.dev --verbose
 
+CHANGELOG (2026-02-22 11:00):
+  - Fixed T22 false-negative: test only accepted HTTP 404/410 for invalid
+    session_id, but spec §6.2 says any 4xx is acceptable. Server returned
+    HTTP 400 (correct graceful rejection); test now accepts any 4xx.
+  - Version: v5.1
+
 CHANGELOG (2026-02-22 10:00):
   - Fixed T08 false-negative: 'FIRST QUESTION' in exclusion list matched
     'In your first question, you requested...' which DEMONSTRATES session memory.
@@ -876,11 +882,14 @@ def test_invalid_session(client):
         f"Server crashed (5xx) on unknown session_id (HTTP {resp.http_status})"
 
     code = resp.raw.get("code", "")
-    if resp.http_status in (404, 410) or "session" in code.lower():
+    if resp.http_status in (400, 404, 410, 422) or "session" in code.lower():
+        # Any 4xx means the server handled it gracefully without crashing.
+        # Spec §6.2 says server MUST return HTTP 4xx (not specifically 404/410).
+        # HTTP 400 (bad request) is a valid rejection of an unknown session_id.
         return TestResult("T22", "Invalid session_id handled gracefully", True,
             notes=f"Server returned session-error response "
                   f"(HTTP {resp.http_status}, code={code}). "
-                  "Correct per spec §6.2.")
+                  "Correct per spec §6.2 — any 4xx gracefully rejects unknown session.")
     elif resp.http_status == 200 and resp.status == "success":
         new_sid = resp.session_id or ""
         treated_as_new = bool(new_sid) and new_sid != fake_sid
@@ -1322,7 +1331,7 @@ def print_report(report: dict):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AHP Test Suite v5")
+    parser = argparse.ArgumentParser(description="AHP Test Suite v5.1")
     parser.add_argument("--target", default="http://localhost:3000")
     parser.add_argument("--nate-target", default="",
                         help="Override Nate site URL (default: auto-included)")
