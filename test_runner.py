@@ -11,6 +11,16 @@ Usage:
     ./venv/bin/python test_runner.py --target https://ref.agenthandshake.dev \\
         --nate-target https://nate.agenthandshake.dev --verbose
 
+CHANGELOG (2026-02-22 16:10):
+  - Added T23: HTTP Link response header (spec §3.5, RFC 8288).
+    Verifies the server proactively sends Link: </.well-known/agent.json>;
+    rel="agent-manifest"; type="application/agent+json" on all HTTP responses
+    (/, /health, POST /agent/converse). Targets agents that inspect headers
+    before parsing body content and agents using HTTP-native clients that
+    never see HTML.
+  - Suite now has 24 conformance tests (T01–T23 + T21b).
+  - Version: v5.4
+
 CHANGELOG (2026-02-22 15:42):
   - Added outlier detection to 3-run benchmark (run_token_comparison_multi):
     any single latency run > 2× the median of the 3 runs is flagged in the
@@ -391,6 +401,10 @@ def run_all_tests(client: AHPClient, target: str, verbose: bool = False,
 
     r = run_test("T22", "Invalid session_id handled gracefully (spec §6.2)",
                  lambda: test_invalid_session(client), verbose)
+    results.append(r)
+
+    r = run_test("T23", "HTTP Link header on all responses (spec §3.5, RFC 8288)",
+                 lambda: test_link_header(client), verbose)
     results.append(r)
 
     # ── Benchmarks — run BEFORE T16 burst to avoid 429 contamination ──────────
@@ -1042,6 +1056,71 @@ def test_invalid_session(client):
             notes=f"Unexpected response to unknown session_id: "
                   f"HTTP {resp.http_status}, status={resp.raw.get('status')}",
             error=f"Unexpected response to invalid session_id (spec §6.2)")
+
+
+def test_link_header(client):
+    """
+    T23: HTTP Link response header present on all responses (spec §3.5, RFC 8288).
+    The server SHOULD include Link: </.well-known/agent.json>; rel="agent-manifest"
+    on every HTTP response — not just HTML pages. Tests root (/), /health,
+    and /agent/converse (POST) to confirm the header is proactive, not conditional.
+    """
+    import urllib.request
+    base = client.base_url.rstrip('/')
+    checks = [
+        ('GET', f'{base}/', None),
+        ('GET', f'{base}/health', None),
+    ]
+
+    results = []
+    for method, url, _ in checks:
+        try:
+            req = urllib.request.Request(url, method=method)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                link_val = resp.headers.get('Link', '')
+                results.append((url, link_val))
+        except Exception as e:
+            results.append((url, f'ERROR: {e}'))
+
+    # Also check a POST to /agent/converse (any response, even 4xx, should have header)
+    try:
+        import json as _json
+        data = _json.dumps({"capability": "site_info", "query": "test link header"}).encode()
+        req = urllib.request.Request(
+            f'{base}/agent/converse',
+            data=data,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                link_val = resp.headers.get('Link', '')
+                results.append((f'{base}/agent/converse', link_val))
+        except urllib.error.HTTPError as e:
+            link_val = e.headers.get('Link', '')
+            results.append((f'{base}/agent/converse', link_val))
+    except Exception as e:
+        results.append((f'{base}/agent/converse', f'ERROR: {e}'))
+
+    missing = []
+    found = []
+    for url, val in results:
+        if not val or 'ERROR' in str(val):
+            missing.append(url)
+        elif 'agent-manifest' in val and '.well-known/agent.json' in val:
+            found.append((url, val))
+        else:
+            missing.append(f'{url} (unexpected value: {val[:80]})')
+
+    if missing:
+        return TestResult("T23", "HTTP Link header on all responses", False,
+            notes=f"Link header missing or incorrect on: {', '.join(missing)}",
+            error="AHP §3.5 Link header not present on all responses (spec §3.5 SHOULD)")
+
+    detail = '; '.join(f'{u.split(base)[1] or "/"}' for u, _ in found)
+    return TestResult("T23", "HTTP Link header on all responses", True,
+        notes=f"Link header confirmed on {len(found)} endpoints ({detail}). "
+              f"Value: {found[0][1] if found else 'N/A'}")
 
 
 def test_ratelimit_headers(client, target):
